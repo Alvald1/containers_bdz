@@ -34,6 +34,7 @@ resource "cloudru_evolution_compute_subnet" "zone" {
   vpc_id         = cloudru_evolution_vpc_vpc.bdz.id
   subnet_address = each.value
   routed_network = true
+  dns_servers    = { value = ["1.1.1.1"] }
   # В mephi основная подсеть уже есть только в AZ-2. Фиксируем выбор,
   # чтобы после создания своих основных подсетей не переключать их обратно.
   default = contains(["ru.AZ-1", "ru.AZ-3"], each.key)

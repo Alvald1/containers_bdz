@@ -64,7 +64,7 @@ resource "cloudru_evolution_compute_vm" "node" {
       permissions = "0644"
       content     = "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n"
     }]
-    runcmd = [["sh", "-c", "sshd -t && systemctl reload ssh"]]
+    runcmd = [["sh", "-c", "install -d -m 0755 /run/sshd && sshd -t && systemctl reload-or-restart ssh"]]
   })}")
 
   depends_on = [
