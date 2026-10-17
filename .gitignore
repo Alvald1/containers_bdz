@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+*.tfplan.txt
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
