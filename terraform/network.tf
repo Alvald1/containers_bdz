@@ -34,7 +34,20 @@ resource "cloudru_evolution_compute_subnet" "zone" {
   vpc_id         = cloudru_evolution_vpc_vpc.bdz.id
   subnet_address = each.value
   routed_network = true
-  default        = false
+  # В mephi основная подсеть уже есть только в AZ-2. Фиксируем выбор,
+  # чтобы после создания своих основных подсетей не переключать их обратно.
+  default = contains(["ru.AZ-1", "ru.AZ-3"], each.key)
+
+  lifecycle {
+    precondition {
+      condition = !contains(["ru.AZ-1", "ru.AZ-3"], each.key) || alltrue([
+        for subnet in data.cloudru_evolution_compute_subnet_collection.existing.subnets :
+        subnet.vpc_id == cloudru_evolution_vpc_vpc.bdz.id && subnet.name == "${local.prefix}-${lower(replace(each.key, ".", "-"))}"
+        if subnet.default && subnet.zone.name == each.key
+      ])
+      error_message = "В ${each.key} уже есть другая основная подсеть. Проверьте её перед изменением default: автоматически переключать её на подсеть БДЗ нельзя."
+    }
+  }
 }
 
 resource "cloudru_evolution_compute_security_group" "node" {

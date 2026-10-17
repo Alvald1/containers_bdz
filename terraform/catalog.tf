@@ -2,6 +2,10 @@ data "cloudru_evolution_compute_zone_collection" "available" {
   project_id = local.project_id
 }
 
+data "cloudru_evolution_compute_subnet_collection" "existing" {
+  project_id = local.project_id
+}
+
 data "cloudru_evolution_compute_image_collection" "available" {
   project_id = local.project_id
 }
