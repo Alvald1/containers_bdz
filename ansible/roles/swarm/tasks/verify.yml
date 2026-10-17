@@ -1,0 +1,42 @@
+---
+- name: Wait for three ready, active and reachable managers with one leader
+  community.docker.docker_swarm_info:
+    nodes: true
+    verbose_output: true
+  delegate_to: "{{ groups['swarm_managers'][0] }}"
+  run_once: true
+  register: swarm_verified
+  until:
+    - swarm_verified.nodes | default([]) | length == 3
+    - swarm_verified.nodes | selectattr('Status.State', 'equalto', 'ready') | list | length == 3
+    - swarm_verified.nodes | selectattr('Spec.Availability', 'equalto', 'active') | list | length == 3
+    - swarm_verified.nodes | selectattr('Spec.Role', 'equalto', 'manager') | list | length == 3
+    - >-
+      swarm_verified.nodes | selectattr('ManagerStatus.Reachability', 'defined')
+      | selectattr('ManagerStatus.Reachability', 'equalto', 'reachable') | list | length == 3
+    - >-
+      swarm_verified.nodes | selectattr('ManagerStatus.Leader', 'defined')
+      | selectattr('ManagerStatus.Leader', 'equalto', true) | list | length == 1
+  retries: 30
+  delay: 2
+  no_log: true
+
+- name: Verify that Swarm uses the expected private addresses
+  ansible.builtin.assert:
+    that:
+      - >-
+        swarm_verified.nodes | map(attribute='Status.Addr') | sort
+        == groups['swarm_managers'] | map('extract', hostvars, 'swarm_advertise_ip') | sort
+    fail_msg: "The cluster contains unexpected nodes or advertises unexpected addresses."
+  run_once: true
+
+- name: Report verified manager status
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.Description.Hostname }}: {{ item.Status.State }},
+      {{ item.Spec.Availability }}, {{ item.Spec.Role }},
+      {{ 'Leader' if item.ManagerStatus.Leader | default(false) else 'Reachable' }}
+  loop: "{{ swarm_verified.nodes }}"
+  loop_control:
+    label: "{{ item.Description.Hostname }}"
+  run_once: true

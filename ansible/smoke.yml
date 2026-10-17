@@ -1,0 +1,48 @@
+---
+- name: Exercise Swarm scheduling and the routing mesh
+  hosts: swarm_managers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run and remove a temporary three-replica HTTP service
+      run_once: true  # noqa: run-once[task] - one temporary service for the whole cluster
+      block:
+        - name: Start one hello container on each manager
+          community.docker.docker_swarm_service:
+            name: bdz-hello
+            image: traefik/whoami:v1.12.0
+            replicas: 3
+            placement:
+              replicas_max_per_node: 1
+            publish:
+              - published_port: 18080
+                target_port: 80
+                mode: ingress
+            state: present
+
+        - name: Wait for all three hello tasks
+          ansible.builtin.command:
+            argv: [docker, service, ls, --filter, name=bdz-hello, --format, "{% raw %}{{.Replicas}}{% endraw %}"]
+          register: hello_replicas
+          changed_when: false
+          until: hello_replicas.stdout.split(' ')[0] == '3/3'
+          retries: 60
+          delay: 5
+
+        - name: Check HTTP through the routing mesh on every manager
+          ansible.builtin.uri:
+            url: http://127.0.0.1:18080/
+            return_content: true
+            use_proxy: false
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['swarm_managers'] }}"
+          register: hello_http
+          until: hello_http.status | default(0) == 200 and 'Hostname:' in hello_http.content | default('')
+          retries: 10
+          delay: 3
+      always:
+        - name: Remove the temporary hello service
+          community.docker.docker_swarm_service:
+            name: bdz-hello
+            state: absent

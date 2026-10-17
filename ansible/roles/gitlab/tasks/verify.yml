@@ -1,0 +1,299 @@
+---
+- name: Verify etcd quorum through every member before checking PostgreSQL
+  run_once: true
+  ansible.builtin.shell: |
+    set -eu
+    # Resolve on every retry: a rollout may replace the container between checks.
+    container_id="$(docker ps \
+      --filter {{ ('label=com.docker.swarm.service.name=' + stack_name + '_etcd-' + ((gitlab_etcd_index + 1) | string)) | quote }} \
+      --format '{% raw %}{{.ID}}{% endraw %}')"
+    test -n "$container_id"
+    timeout 12s docker exec "$container_id" /usr/local/bin/etcdctl \
+      --endpoints=http://127.0.0.1:2379 --command-timeout=5s endpoint health
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['swarm_managers'] }}"
+  loop_control:
+    index_var: gitlab_etcd_index
+  register: gitlab_etcd_health
+  changed_when: false
+  until: gitlab_etcd_health.rc == 0
+  retries: 30
+  delay: 2
+
+- name: Verify PostgreSQL roles, streaming and replicated writes
+  run_once: true
+  block:
+    - name: Read each PostgreSQL role from its current healthy container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json
+            import subprocess
+            import sys
+            containers = subprocess.check_output([
+                "docker", "ps", "--filter", "health=healthy", "--filter",
+                "label=com.docker.swarm.service.name=" + sys.argv[1],
+                "--format", "{% raw %}{{.ID}}{% endraw %}"
+            ], text=True, timeout=10).splitlines()
+            if len(containers) != 1:
+                sys.exit("Waiting for one healthy PostgreSQL container")
+            role = subprocess.check_output([
+                "docker", "exec", "--user", "postgres", containers[0],
+                "psql", "--no-psqlrc", "--username=postgres", "--dbname=postgres",
+                "--tuples-only", "--no-align", "--set=ON_ERROR_STOP=1",
+                "--command=SELECT pg_is_in_recovery();"
+            ], text=True, timeout=15).strip()
+            if role not in ("t", "f"):
+                sys.exit("Unexpected PostgreSQL recovery state")
+            print(json.dumps({"container": containers[0], "role": role}))
+          - "{{ stack_name }}_postgres-{{ gitlab_postgres_index + 1 }}"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['swarm_managers'] }}"
+      loop_control:
+        index_var: gitlab_postgres_index
+      register: gitlab_postgres_snapshots
+      changed_when: false
+      until: gitlab_postgres_snapshots.rc == 0
+      retries: 90
+      delay: 5
+
+    - name: Reset the PostgreSQL acceptance snapshot
+      ansible.builtin.set_fact:
+        gitlab_postgres_containers: {results: []}
+        gitlab_postgres_roles: {results: []}
+
+    - name: Remember the verified container and role together
+      ansible.builtin.set_fact:
+        gitlab_postgres_containers:
+          results: "{{ gitlab_postgres_containers.results + [gitlab_postgres_container] }}"
+        gitlab_postgres_roles:
+          results: "{{ gitlab_postgres_roles.results + [{'stdout': gitlab_postgres_snapshot.role, 'item': gitlab_postgres_container}] }}"
+      vars:
+        gitlab_postgres_snapshot: "{{ item.stdout | from_json }}"
+        gitlab_postgres_container:
+          stdout: "{{ gitlab_postgres_snapshot.container }}"
+          item: "{{ item.item }}"
+          gitlab_postgres_index: "{{ item.gitlab_postgres_index }}"
+      loop: "{{ gitlab_postgres_snapshots.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Require exactly one primary and two standbys
+      ansible.builtin.assert:
+        that:
+          - gitlab_postgres_roles.results | selectattr('stdout', 'equalto', 'f') | list | length == 1
+          - gitlab_postgres_roles.results | selectattr('stdout', 'equalto', 't') | list | length == 2
+        fail_msg: PostgreSQL must have exactly one writable primary and two standbys.
+
+    - name: Remember the primary and standbys for acceptance checks
+      ansible.builtin.set_fact:
+        gitlab_postgres_primary: "{{ gitlab_postgres_roles.results | selectattr('stdout', 'equalto', 'f') | first }}"
+        gitlab_postgres_standbys: "{{ gitlab_postgres_roles.results | selectattr('stdout', 'equalto', 't') | list }}"
+        gitlab_postgres_probe_id: "{{ now(utc=true, fmt='%Y%m%d%H%M%S%f') }}"
+
+    - name: Wait until both standbys stream from the primary
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - postgres
+          - "{{ gitlab_postgres_primary.item.stdout }}"
+          - psql
+          - --no-psqlrc
+          - --username=postgres
+          - --dbname=postgres
+          - --tuples-only
+          - --no-align
+          - --set=ON_ERROR_STOP=1
+          - "--command=SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';"
+      delegate_to: "{{ gitlab_postgres_primary.item.item }}"
+      register: gitlab_postgres_streaming
+      changed_when: false
+      until: gitlab_postgres_streaming.rc == 0 and gitlab_postgres_streaming.stdout == '2'
+      retries: 60
+      delay: 5
+
+    - name: Verify two active physical replication slots on the primary
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - postgres
+          - "{{ gitlab_postgres_primary.item.stdout }}"
+          - psql
+          - --no-psqlrc
+          - --username=postgres
+          - --dbname=postgres
+          - --tuples-only
+          - --no-align
+          - --set=ON_ERROR_STOP=1
+          - "--command=SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND active;"
+      delegate_to: "{{ gitlab_postgres_primary.item.item }}"
+      register: gitlab_postgres_physical_slots
+      changed_when: false
+      until: gitlab_postgres_physical_slots.rc == 0 and gitlab_postgres_physical_slots.stdout == '2'
+      retries: 30
+      delay: 2
+
+    - name: Verify that each standby receives physical WAL through streaming
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - postgres
+          - "{{ item.item.stdout }}"
+          - psql
+          - --no-psqlrc
+          - --username=postgres
+          - --dbname=postgres
+          - --tuples-only
+          - --no-align
+          - --set=ON_ERROR_STOP=1
+          - "--command=SELECT count(*) FROM pg_stat_wal_receiver WHERE status = 'streaming';"
+      delegate_to: "{{ item.item.item }}"
+      loop: "{{ gitlab_postgres_standbys }}"
+      loop_control:
+        label: "{{ item.item.item }}"
+      register: gitlab_postgres_wal_receiver
+      changed_when: false
+      until: gitlab_postgres_wal_receiver.rc == 0 and gitlab_postgres_wal_receiver.stdout == '1'
+      retries: 30
+      delay: 2
+
+    - name: Confirm Patroni health agrees with the SQL roles
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ item.item.stdout }}"
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --max-time
+          - '5'
+          - "http://127.0.0.1:8008/{{ 'primary' if item.stdout == 'f' else 'replica' }}"
+      delegate_to: "{{ item.item.item }}"
+      loop: "{{ gitlab_postgres_roles.results }}"
+      loop_control:
+        label: "{{ item.item.item }}"
+      register: gitlab_postgres_patroni_health
+      changed_when: false
+      until: gitlab_postgres_patroni_health.rc == 0
+      retries: 30
+      delay: 2
+
+    - name: Prove that a committed row reaches both standbys
+      block:
+        - name: Write a unique probe in the postgres database outside GitLab schemas
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - --interactive
+              - --user
+              - postgres
+              - "{{ gitlab_postgres_primary.item.stdout }}"
+              - psql
+              - --no-psqlrc
+              - --username=postgres
+              - --dbname=postgres
+              - --set=ON_ERROR_STOP=1
+            stdin: |
+              CREATE SCHEMA bdz_acceptance_{{ gitlab_postgres_probe_id }};
+              CREATE TABLE bdz_acceptance_{{ gitlab_postgres_probe_id }}.probe (token text PRIMARY KEY);
+              INSERT INTO bdz_acceptance_{{ gitlab_postgres_probe_id }}.probe VALUES ('{{ gitlab_postgres_probe_id }}');
+          delegate_to: "{{ gitlab_postgres_primary.item.item }}"
+          changed_when: true
+
+        - name: Wait for the exact committed probe on each standby
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - --user
+              - postgres
+              - "{{ item.item.stdout }}"
+              - psql
+              - --no-psqlrc
+              - --username=postgres
+              - --dbname=postgres
+              - --tuples-only
+              - --no-align
+              - --set=ON_ERROR_STOP=1
+              - "--command=SELECT token FROM bdz_acceptance_{{ gitlab_postgres_probe_id }}.probe WHERE token = '{{ gitlab_postgres_probe_id }}';"
+          delegate_to: "{{ item.item.item }}"
+          loop: "{{ gitlab_postgres_standbys }}"
+          loop_control:
+            label: "{{ item.item.item }}"
+          register: gitlab_postgres_replayed_probe
+          changed_when: false
+          until: gitlab_postgres_replayed_probe.rc == 0 and gitlab_postgres_replayed_probe.stdout == gitlab_postgres_probe_id
+          retries: 30
+          delay: 2
+      always:
+        - name: Remove the probe schema from whichever instance is currently primary
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - --interactive
+              - --user
+              - postgres
+              - "{{ item.stdout }}"
+              - psql
+              - --no-psqlrc
+              - --username=postgres
+              - --dbname=postgres
+              - --set=ON_ERROR_STOP=1
+            stdin: |
+              SELECT 'DROP SCHEMA IF EXISTS bdz_acceptance_{{ gitlab_postgres_probe_id }} CASCADE;'
+              WHERE NOT pg_is_in_recovery()
+              \gexec
+          delegate_to: "{{ item.item }}"
+          loop: "{{ gitlab_postgres_containers.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          register: gitlab_postgres_probe_cleanup
+          changed_when: "'DROP SCHEMA' in gitlab_postgres_probe_cleanup.stdout"
+
+- name: Wait for GitLab and its dependencies through every manager
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ gitlab_http_port }}/-/readiness?all=1"
+    headers:
+      Host: "{{ gitlab_external_url | urlsplit('netloc') }}"
+    return_content: true
+    use_proxy: false
+    timeout: 15
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['swarm_managers'] | sort }}"
+  register: gitlab_readiness
+  until: gitlab_readiness.status | default(0) == 200
+  retries: 90
+  delay: 10
+  run_once: true
+
+- name: Check the GitLab sign-in page through every manager
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ gitlab_http_port }}/users/sign_in"
+    headers:
+      Host: "{{ gitlab_external_url | urlsplit('netloc') }}"
+    return_content: true
+    use_proxy: false
+    timeout: 15
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['swarm_managers'] | sort }}"
+  register: gitlab_sign_in
+  until:
+    - gitlab_sign_in.status | default(0) == 200
+    - "'user[login]' in gitlab_sign_in.content | default('')"
+  retries: 6
+  delay: 5
+  run_once: true

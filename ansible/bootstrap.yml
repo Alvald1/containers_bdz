@@ -1,0 +1,9 @@
+---
+- name: Install Docker and assemble three Swarm managers
+  hosts: swarm_managers
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - docker
+    - swarm

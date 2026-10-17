@@ -1,0 +1,13 @@
+---
+ansible_python_interpreter: /usr/bin/python3
+
+stack_name: bdz
+stack_dir: /opt/containers-bdz
+gitlab_image: gitlab/gitlab-ce:19.4.2-ce.0
+nginx_image: nginx:1.30.6-alpine
+etcd_image: quay.io/coreos/etcd:v3.6.15
+haproxy_image: haproxy:3.2.26-alpine
+gitlab_external_url: http://gitlab.bdz.test:8080
+gitlab_http_port: 8080
+gitlab_ssh_port: 2222
+gitlab_data_node: manager-1

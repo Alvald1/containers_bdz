@@ -1,0 +1,14 @@
+---
+- name: Prepare the Docker Swarm cluster
+  ansible.builtin.import_playbook: bootstrap.yml
+
+- name: Check the routing mesh before deploying GitLab
+  ansible.builtin.import_playbook: smoke.yml
+
+- name: Deploy GitLab and highly available PostgreSQL
+  hosts: swarm_managers
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - gitlab

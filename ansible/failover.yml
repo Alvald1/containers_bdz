@@ -1,0 +1,185 @@
+---
+- name: Exercise automatic PostgreSQL failover and restore all three members
+  hosts: swarm_managers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify the healthy cluster before stopping a database member
+      ansible.builtin.import_tasks: roles/gitlab/tasks/verify.yml
+
+    - name: Remember the original primary and the failover probe
+      ansible.builtin.set_fact:
+        gitlab_postgres_failover_member: "postgres-{{ gitlab_postgres_primary.item.gitlab_postgres_index + 1 }}"
+        gitlab_postgres_failover_probe_id: "{{ gitlab_postgres_probe_id }}"
+      run_once: true
+
+    - name: Test election, preserved data and application recovery
+      run_once: true
+      block:
+        - name: Commit a probe before stopping the primary
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - --interactive
+              - --user
+              - postgres
+              - "{{ gitlab_postgres_primary.item.stdout }}"
+              - psql
+              - --no-psqlrc
+              - --username=postgres
+              - --dbname=postgres
+              - --set=ON_ERROR_STOP=1
+            stdin: |
+              CREATE SCHEMA bdz_failover_{{ gitlab_postgres_failover_probe_id }};
+              CREATE TABLE bdz_failover_{{ gitlab_postgres_failover_probe_id }}.probe (phase text PRIMARY KEY);
+              INSERT INTO bdz_failover_{{ gitlab_postgres_failover_probe_id }}.probe VALUES ('before');
+          delegate_to: "{{ gitlab_postgres_primary.item.item }}"
+          changed_when: true
+
+        - name: Stop the primary service without changing its persistent data
+          ansible.builtin.command:
+            argv: [docker, service, scale, "{{ stack_name }}_{{ gitlab_postgres_failover_member }}=0"]
+          delegate_to: "{{ groups['swarm_managers'][0] }}"
+          changed_when: true
+
+        - name: Wait for Patroni to elect a different leader
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ gitlab_postgres_standbys[0].item.stdout }}"
+              - curl
+              - --fail
+              - --silent
+              - --show-error
+              - --max-time
+              - '5'
+              - http://127.0.0.1:8008/cluster
+          delegate_to: "{{ gitlab_postgres_standbys[0].item.item }}"
+          register: gitlab_postgres_failover_cluster
+          changed_when: false
+          until: >-
+            gitlab_postgres_failover_cluster.rc == 0
+            and (gitlab_postgres_failover_cluster.stdout | from_json).members
+            | selectattr('role', 'equalto', 'leader') | list | length == 1
+            and (gitlab_postgres_failover_cluster.stdout | from_json).members
+            | selectattr('role', 'equalto', 'leader')
+            | rejectattr('name', 'equalto', gitlab_postgres_failover_member) | list | length == 1
+          retries: 45
+          delay: 2
+
+        - name: Remember the promoted member
+          ansible.builtin.set_fact:
+            gitlab_postgres_failover_leader: >-
+              {{ ((gitlab_postgres_failover_cluster.stdout | from_json).members
+              | selectattr('role', 'equalto', 'leader') | first).name }}
+
+        - name: Locate the promoted member's container
+          ansible.builtin.set_fact:
+            gitlab_postgres_failover_promoted: >-
+              {{ gitlab_postgres_containers.results[(gitlab_postgres_failover_leader | regex_replace('^postgres-', '') | int) - 1] }}
+
+        - name: Wait until the elected leader serves the primary health endpoint
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ gitlab_postgres_failover_promoted.stdout }}"
+              - curl
+              - --fail
+              - --silent
+              - --show-error
+              - --max-time
+              - '5'
+              - http://127.0.0.1:8008/primary
+          delegate_to: "{{ gitlab_postgres_failover_promoted.item }}"
+          register: gitlab_postgres_promoted_health
+          changed_when: false
+          until: gitlab_postgres_promoted_health.rc == 0
+          retries: 30
+          delay: 2
+
+        - name: Verify the old committed row survives and the new primary accepts writes
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - --interactive
+              - --user
+              - postgres
+              - "{{ gitlab_postgres_failover_promoted.stdout }}"
+              - psql
+              - --no-psqlrc
+              - --username=postgres
+              - --dbname=postgres
+              - --tuples-only
+              - --no-align
+              - --quiet
+              - --set=ON_ERROR_STOP=1
+            stdin: |
+              SET statement_timeout = '60s';
+              INSERT INTO bdz_failover_{{ gitlab_postgres_failover_probe_id }}.probe VALUES ('after');
+              SELECT string_agg(phase, ',' ORDER BY phase)
+              FROM bdz_failover_{{ gitlab_postgres_failover_probe_id }}.probe;
+          delegate_to: "{{ gitlab_postgres_failover_promoted.item }}"
+          register: gitlab_postgres_failover_write
+          changed_when: true
+          failed_when: gitlab_postgres_failover_write.rc != 0 or gitlab_postgres_failover_write.stdout != 'after,before'
+
+        - name: Wait for GitLab to recover through HAProxy on every manager
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ gitlab_http_port }}/-/readiness?all=1"
+            headers:
+              Host: "{{ gitlab_external_url | urlsplit('netloc') }}"
+            use_proxy: false
+            timeout: 10
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['swarm_managers'] }}"
+          register: gitlab_failover_readiness
+          until: gitlab_failover_readiness.status | default(0) == 200
+          retries: 30
+          delay: 2
+
+        - name: Report the observed primary change
+          ansible.builtin.debug:
+            msg: >-
+              Patroni promoted {{ gitlab_postgres_failover_leader }} after stopping {{ gitlab_postgres_failover_member }};
+              the probe row survived, a new write succeeded and GitLab recovered.
+      always:
+        - name: Restore the stopped database service even if an acceptance check failed
+          ansible.builtin.command:
+            argv: [docker, service, scale, "{{ stack_name }}_{{ gitlab_postgres_failover_member }}=1"]
+          delegate_to: "{{ groups['swarm_managers'][0] }}"
+          changed_when: true
+
+        - name: Verify restoration and remove the failover probe
+          block:
+            - name: Wait for one primary, two streaming standbys and GitLab
+              ansible.builtin.import_tasks: roles/gitlab/tasks/verify.yml
+          always:
+            - name: Drop only the temporary failover schema on the current primary
+              ansible.builtin.command:
+                argv:
+                  - docker
+                  - exec
+                  - --interactive
+                  - --user
+                  - postgres
+                  - "{{ item.stdout }}"
+                  - psql
+                  - --no-psqlrc
+                  - --username=postgres
+                  - --dbname=postgres
+                  - --set=ON_ERROR_STOP=1
+                stdin: |
+                  SELECT 'DROP SCHEMA IF EXISTS bdz_failover_{{ gitlab_postgres_failover_probe_id }} CASCADE;'
+                  WHERE NOT pg_is_in_recovery()
+                  \gexec
+              delegate_to: "{{ item.item }}"
+              loop: "{{ gitlab_postgres_containers.results }}"
+              loop_control:
+                label: "{{ item.item }}"
+              register: gitlab_postgres_failover_cleanup
+              changed_when: "'DROP SCHEMA' in gitlab_postgres_failover_cleanup.stdout"

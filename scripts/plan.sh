@@ -3,7 +3,18 @@ set +x
 set -euo pipefail
 umask 077
 
+if [[ $# -gt 1 ]]; then
+  printf '%s\n' 'Допускается только один аргумент: --registry.' >&2
+  exit 1
+fi
+case "${1:-}" in
+  '') set -- ;;
+  --registry) set -- -target=cloudru_evolution_artifact_registry_registry.bdz ;;
+  *) printf '%s\n' 'Использование: bash scripts/plan.sh [--registry]' >&2; exit 1 ;;
+esac
+
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="$repo_dir/.tools:$PATH"
 cd "$repo_dir/terraform"
 
 if [[ ! -s mephi.tfvars ]]; then
@@ -26,4 +37,9 @@ unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN TF_LOG TF_LOG_PATH
 terraform init -input=false -no-color
 terraform fmt -check
 terraform validate -no-color
-terraform plan -input=false -no-color -var-file=mephi.tfvars -out=mephi.tfplan | tee mephi.tfplan.txt
+# После неудачного plan нельзя случайно применить предыдущий сохранённый план.
+rm -f mephi.tfplan
+if ! terraform plan -input=false -no-color -var-file=mephi.tfvars "$@" -out=mephi.tfplan | tee mephi.tfplan.txt; then
+  rm -f mephi.tfplan
+  exit 1
+fi

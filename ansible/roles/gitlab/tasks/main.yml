@@ -1,0 +1,184 @@
+---
+- name: Require the Terraform registry endpoint
+  ansible.builtin.assert:
+    that:
+      - registry_endpoint is defined
+      - registry_endpoint | default('') is match('^[a-z0-9-]+[.]cr[.]cloud[.]ru$')
+    fail_msg: Run scripts/bootstrap-registry.sh to create/import the registry and refresh the inventory.
+  run_once: true
+
+- name: Require credentials for the private registry
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'REGISTRY_USERNAME', default=lookup('ansible.builtin.env', 'AUTH_KEY_ID')) | length > 0
+      - lookup('ansible.builtin.env', 'REGISTRY_PASSWORD', default=lookup('ansible.builtin.env', 'AUTH_SECRET')) | length > 0
+    fail_msg: Export REGISTRY_USERNAME/REGISTRY_PASSWORD or AUTH_KEY_ID/AUTH_SECRET on the control machine.
+  run_once: true
+  no_log: true
+
+- name: Create the deployment directory
+  ansible.builtin.file:
+    path: "{{ stack_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Create persistent PostgreSQL storage on each node
+  ansible.builtin.file:
+    path: /srv/bdz/postgres
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: "0700"
+
+- name: Create persistent etcd storage on each node
+  ansible.builtin.file:
+    path: /srv/bdz/etcd
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create GitLab directories and preserve permissions managed by Omnibus
+  # Omnibus owns permissions after bootstrap; resetting them breaks running services.
+  ansible.builtin.file:
+    path: "/srv/bdz/gitlab/{{ item }}"
+    state: directory
+  # noqa: risky-file-permissions
+  loop: [config, logs, data]
+  when: inventory_hostname == gitlab_data_node
+
+- name: Copy the PostgreSQL and Patroni image sources
+  ansible.builtin.copy:
+    src: postgres/
+    dest: "{{ stack_dir }}/postgres/"
+    mode: "0644"
+  run_once: true
+
+- name: Derive the image tag from its source content
+  ansible.builtin.set_fact:
+    gitlab_postgres_build_tag: >-
+      {{ (lookup('ansible.builtin.file', role_path + '/files/postgres/Dockerfile')
+          + lookup('ansible.builtin.file', role_path + '/files/postgres/entrypoint.py')
+          + lookup('ansible.builtin.file', role_path + '/files/postgres/post-bootstrap.sh'))
+          | hash('sha256') | truncate(12, true, '') }}
+
+- name: Build PostgreSQL on the first manager
+  community.docker.docker_image_build:
+    name: bdz-postgres
+    tag: "{{ gitlab_postgres_build_tag }}"
+    path: "{{ stack_dir }}/postgres"
+    rebuild: never
+  run_once: true
+
+- name: Create a temporary registry login directory in memory
+  ansible.builtin.file:
+    path: /dev/shm/bdz-registry
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  run_once: true
+
+- name: Configure and deploy the stack from the first manager
+  run_once: true
+  environment:
+    DOCKER_CONFIG: /dev/shm/bdz-registry
+  block:
+    - name: Authenticate to Cloud.ru Registry using temporary credentials
+      community.docker.docker_login:
+        registry_url: "{{ registry_endpoint }}"
+        username: "{{ lookup('ansible.builtin.env', 'REGISTRY_USERNAME', default=lookup('ansible.builtin.env', 'AUTH_KEY_ID')) }}"
+        password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD', default=lookup('ansible.builtin.env', 'AUTH_SECRET')) }}"
+        config_path: /dev/shm/bdz-registry/config.json
+      no_log: true
+
+    - name: Tag PostgreSQL for the private registry
+      community.docker.docker_image_tag:
+        name: "bdz-postgres:{{ gitlab_postgres_build_tag }}"
+        repository: ["{{ registry_endpoint }}/postgres:{{ gitlab_postgres_build_tag }}"]
+
+    - name: Push the PostgreSQL and Patroni image
+      community.docker.docker_image_push:
+        name: "{{ registry_endpoint }}/postgres"
+        tag: "{{ gitlab_postgres_build_tag }}"
+        timeout: 600
+
+    - name: Label nodes for persistent data placement
+      community.docker.docker_node:
+        hostname: "{{ hostvars[item].ansible_facts.hostname }}"
+        labels:
+          bdz_node: "{{ item }}"
+        labels_state: merge
+      loop: "{{ groups['swarm_managers'] }}"
+
+    - name: List existing Docker secret names
+      ansible.builtin.command:
+        argv: [docker, secret, ls, --format, "{% raw %}{{.Name}}{% endraw %}"]
+      register: gitlab_existing_secrets
+      changed_when: false
+
+    - name: Generate missing passwords directly into Docker Secrets
+      community.docker.docker_secret:
+        name: "{{ stack_name }}_{{ item }}"
+        data: "{{ lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) }}"
+        state: present
+      loop:
+        - postgres_password
+        - replication_password
+        - patroni_api_password
+        - gitlab_db_password
+        - gitlab_root_password
+      when: stack_name + '_' + item not in gitlab_existing_secrets.stdout_lines
+      no_log: true
+
+    - name: Publish the GitLab configuration
+      community.docker.docker_config:
+        name: "{{ stack_name }}_gitlab"
+        data: "{{ lookup('ansible.builtin.template', 'gitlab.rb.j2') }}"
+        rolling_versions: true
+        versions_to_keep: 3
+      register: gitlab_config
+
+    - name: Publish the Nginx configuration
+      community.docker.docker_config:
+        name: "{{ stack_name }}_nginx"
+        data: "{{ lookup('ansible.builtin.template', 'nginx.conf.j2') }}"
+        rolling_versions: true
+        versions_to_keep: 3
+      register: gitlab_nginx_config
+
+    - name: Publish the HAProxy configuration
+      community.docker.docker_config:
+        name: "{{ stack_name }}_haproxy"
+        data: "{{ lookup('ansible.builtin.template', 'haproxy.cfg.j2') }}"
+        rolling_versions: true
+        versions_to_keep: 3
+      register: gitlab_haproxy_config
+
+    - name: Render the Swarm stack
+      ansible.builtin.template:
+        src: stack.yml.j2
+        dest: "{{ stack_dir }}/stack.yml"
+        mode: "0644"
+
+    - name: Validate the stack with Docker
+      ansible.builtin.command:
+        argv: [docker, stack, config, --compose-file, "{{ stack_dir }}/stack.yml"]
+      changed_when: false
+
+    - name: Deploy GitLab and PostgreSQL
+      community.docker.docker_stack:
+        name: "{{ stack_name }}"
+        compose: ["{{ stack_dir }}/stack.yml"]
+        state: present
+        resolve_image: always
+        with_registry_auth: true
+  always:
+    - name: Remove temporary registry credentials from the manager
+      ansible.builtin.file:
+        path: /dev/shm/bdz-registry
+        state: absent
+      no_log: true
+
+- name: Verify the application and PostgreSQL replication
+  ansible.builtin.import_tasks: verify.yml

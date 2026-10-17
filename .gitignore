@@ -13,3 +13,12 @@
 !*.tfvars.example
 crash.log
 crash.*.log
+.venv/
+.tools/
+__pycache__/
+ansible/inventory.json
+ansible/.inventory.*/
+ansible/known_hosts
+ansible/known_hosts.old
+ansible/collections/
+ansible/.cache/

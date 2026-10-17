@@ -1,0 +1,12 @@
+---
+- name: Verify the deployed Swarm, PostgreSQL cluster and GitLab
+  hosts: swarm_managers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify the three Swarm managers
+      ansible.builtin.import_tasks: roles/swarm/tasks/verify.yml
+
+    - name: Verify PostgreSQL replication and GitLab availability
+      ansible.builtin.import_tasks: roles/gitlab/tasks/verify.yml

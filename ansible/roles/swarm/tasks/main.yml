@@ -1,0 +1,97 @@
+---
+- name: Require all three managers in this play
+  ansible.builtin.assert:
+    that:
+      - groups['swarm_managers'] | length == 3
+      - ansible_play_batch | sort == groups['swarm_managers'] | sort
+      - >-
+        groups['swarm_managers'] | map('extract', hostvars, 'swarm_advertise_ip')
+        | unique | list | length == 3
+    fail_msg: "Run the Swarm play on all three managers, without --limit or serial."
+  run_once: true
+
+- name: Read the existing Docker Swarm state
+  community.docker.docker_host_info:
+  register: swarm_before
+  no_log: true
+  any_errors_fatal: true
+
+- name: Refuse to reset an existing or unhealthy Swarm membership
+  ansible.builtin.assert:
+    that:
+      - swarm_before.host_info.Swarm.LocalNodeState in ['inactive', 'active']
+      - >-
+        swarm_before.host_info.Swarm.LocalNodeState != 'active'
+        or swarm_before.host_info.Swarm.ControlAvailable
+      - >-
+        swarm_before.host_info.Swarm.LocalNodeState != 'active'
+        or hostvars[groups['swarm_managers'][0]].swarm_before.host_info.Swarm.LocalNodeState == 'active'
+    fail_msg: >-
+      A node has an unexpected Swarm membership, or the seed is inactive while
+      another node is already active. Inspect the cluster before running again;
+      this playbook never leaves, resets or force-initializes an existing cluster.
+  any_errors_fatal: true
+
+- name: Refuse managers belonging to another cluster
+  ansible.builtin.assert:
+    that:
+      - >-
+        swarm_before.host_info.Swarm.Cluster.ID
+        == hostvars[groups['swarm_managers'][0]].swarm_before.host_info.Swarm.Cluster.ID
+    fail_msg: "The existing managers belong to different Swarm clusters."
+  when: swarm_before.host_info.Swarm.LocalNodeState == 'active'
+  any_errors_fatal: true
+
+- name: Initialize Swarm on the first inventory manager
+  community.docker.docker_swarm:
+    state: present
+    advertise_addr: "{{ swarm_advertise_ip }}"
+    listen_addr: "{{ swarm_advertise_ip }}:2377"
+    data_path_addr: "{{ swarm_advertise_ip }}"
+  when:
+    - inventory_hostname == groups['swarm_managers'][0]
+    - swarm_before.host_info.Swarm.LocalNodeState == 'inactive'
+  no_log: true
+
+- name: Read the existing manager join token from the seed
+  community.docker.docker_swarm_info:
+    nodes: true
+    verbose_output: true
+  delegate_to: "{{ groups['swarm_managers'][0] }}"
+  run_once: true
+  register: swarm_seed
+  no_log: true
+
+- name: Refuse a seed cluster containing unexpected nodes
+  ansible.builtin.assert:
+    that:
+      - >-
+        swarm_seed.nodes | map(attribute='Status.Addr')
+        | difference(groups['swarm_managers'] | map('extract', hostvars, 'swarm_advertise_ip'))
+        | length == 0
+      - >-
+        swarm_seed.nodes | map(attribute='Status.Addr') | unique | list | length
+        == swarm_seed.nodes | length
+      - >-
+        swarm_seed.nodes | selectattr('Spec.Role', 'equalto', 'manager') | list | length
+        == swarm_seed.nodes | length
+    fail_msg: "The seed cluster contains unexpected nodes; inspect it before adding managers."
+  run_once: true
+  any_errors_fatal: true
+
+- name: Join inactive nodes as managers using their private addresses
+  community.docker.docker_swarm:
+    state: join
+    advertise_addr: "{{ swarm_advertise_ip }}"
+    listen_addr: "{{ swarm_advertise_ip }}:2377"
+    data_path_addr: "{{ swarm_advertise_ip }}"
+    remote_addrs:
+      - "{{ hostvars[groups['swarm_managers'][0]].swarm_advertise_ip }}:2377"
+    join_token: "{{ swarm_seed.swarm_facts.JoinTokens.Manager }}"
+  when:
+    - inventory_hostname != groups['swarm_managers'][0]
+    - swarm_before.host_info.Swarm.LocalNodeState == 'inactive'
+  no_log: true
+
+- name: Verify the Swarm managers
+  ansible.builtin.import_tasks: verify.yml

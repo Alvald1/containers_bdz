@@ -25,7 +25,10 @@ output "ansible_inventory" {
   description = "JSON inventory для следующего этапа Ansible через прямой SSH."
   value = {
     all = {
-      vars = { ansible_user = var.ssh_user }
+      vars = {
+        ansible_user      = var.ssh_user
+        registry_endpoint = "${cloudru_evolution_artifact_registry_registry.bdz.name}.cr.cloud.ru"
+      }
       children = {
         swarm_managers = {
           hosts = {
@@ -37,6 +40,14 @@ output "ansible_inventory" {
         }
       }
     }
+  }
+}
+
+output "container_registry" {
+  description = "Приватный Docker Registry для образов БДЗ. Ключи доступа не входят в output."
+  value = {
+    id       = cloudru_evolution_artifact_registry_registry.bdz.id
+    endpoint = "${cloudru_evolution_artifact_registry_registry.bdz.name}.cr.cloud.ru"
   }
 }
 

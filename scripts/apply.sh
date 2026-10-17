@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="$repo_dir/.tools:$PATH"
 cd "$repo_dir/terraform"
 
 if [[ ! -s mephi.tfplan ]]; then

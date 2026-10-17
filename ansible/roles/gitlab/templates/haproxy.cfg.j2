@@ -1,0 +1,29 @@
+global
+    log stdout format raw local0
+    maxconn 1024
+
+defaults
+    log global
+    mode tcp
+    timeout connect 5s
+    timeout client 1h
+    timeout server 1h
+
+resolvers docker
+    nameserver dns 127.0.0.11:53
+    resolve_retries 3
+    timeout resolve 1s
+    timeout retry 1s
+    hold valid 10s
+
+frontend postgres
+    bind :5432
+    default_backend postgres_primary
+
+backend postgres_primary
+    option httpchk GET /primary
+    http-check expect status 200
+    default-server inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
+{% for node in groups['swarm_managers'] %}
+    server postgres-{{ loop.index }} postgres-{{ loop.index }}:5432 check port 8008 resolvers docker init-addr libc,none
+{% endfor %}

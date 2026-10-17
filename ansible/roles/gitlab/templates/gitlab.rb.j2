@@ -1,0 +1,25 @@
+external_url '{{ gitlab_external_url }}'
+letsencrypt['enable'] = false
+nginx['listen_port'] = 80
+nginx['listen_https'] = false
+gitlab_rails['gitlab_shell_ssh_port'] = {{ gitlab_ssh_port }}
+gitlab_rails['initial_root_password'] = File.read('/run/secrets/gitlab_root_password').strip
+gitlab_rails['display_initial_root_password'] = false
+gitlab_rails['store_initial_root_password'] = false
+gitlab_rails['monitoring_whitelist'] = ['127.0.0.0/8', '172.30.10.0/24']
+
+postgresql['enable'] = false
+gitlab_rails['db_adapter'] = 'postgresql'
+gitlab_rails['db_encoding'] = 'unicode'
+gitlab_rails['db_host'] = 'postgres'
+gitlab_rails['db_port'] = 5432
+gitlab_rails['db_database'] = 'gitlabhq_production'
+gitlab_rails['db_username'] = 'gitlab'
+gitlab_rails['db_password'] = File.read('/run/secrets/gitlab_db_password').strip
+
+# Учебный стенд: оставляем ресурсы PostgreSQL и системным службам.
+puma['worker_processes'] = 2
+sidekiq['concurrency'] = 5
+prometheus_monitoring['enable'] = false
+gitlab_kas['enable'] = false
+gitlab_rails['gitlab_signup_enabled'] = false
