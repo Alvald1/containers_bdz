@@ -87,6 +87,29 @@ less terraform/mephi.tfplan.txt
 unset AUTH_KEY_ID AUTH_SECRET
 ```
 
+## Создание ВМ по проверенному плану
+
+После просмотра плана и решения создать ресурсы, в том же терминале с
+`AUTH_KEY_ID` и `AUTH_SECRET`:
+
+```sh
+bash scripts/apply.sh
+```
+
+Скрипт применяет сохранённый `terraform/mephi.tfplan` и создаёт платные ресурсы.
+Повторного интерактивного подтверждения для сохранённого плана Terraform нет.
+Результат сохраняется в `terraform/mephi.apply.log`, который исключён из Git.
+Не запускайте несколько операций с этим state одновременно.
+
+Для согласованной пары SSH используется публичный `~/.ssh/univ.pub`, а при
+подключении — приватный `~/.ssh/univ`. Приватный ключ в Terraform не передаётся:
+
+```sh
+ssh -i ~/.ssh/univ -o IdentitiesOnly=yes bdz@PUBLIC_IP
+```
+
+`PUBLIC_IP` нужно взять из output `nodes` после успешного создания.
+
 ## Границы проверки
 
 Backend на Terraform 1.6.6 используется без блокировки S3 state, одним
